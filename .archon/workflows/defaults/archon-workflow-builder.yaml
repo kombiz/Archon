@@ -63,10 +63,11 @@ nodes:
       Be specific and concrete. Each proposed node should have a clear type
       (bash, prompt, command, script, loop, or approval) and a one-line
       description of what it does.
+    provider: claude
     model: haiku
-    allowed_tools: []
     output_format:
       type: object
+      additionalProperties: false
       properties:
         workflow_name:
           type: string
@@ -83,6 +84,7 @@ nodes:
     depends_on: [scan-codebase]
 
   - id: generate-yaml
+    provider: claude
     prompt: |
       You are an Archon workflow author. Generate a complete, valid workflow YAML file
       based on the structured intent provided.
@@ -227,6 +229,7 @@ nodes:
     depends_on: [generate-yaml]
 
   - id: save-or-report
+    provider: claude
     prompt: |
       You are a workflow installer. Save the generated workflow and report to the user.
 
