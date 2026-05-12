@@ -1036,6 +1036,36 @@ export function registerApiRoutes(
     return { accepted: true, status: result.status };
   }
 
+  async function resolveConversationRouteTarget(inputId: string): Promise<{
+    conversation: Awaited<ReturnType<typeof conversationDb.findConversationByPlatformId>> | null;
+    platformConversationId: string;
+  }> {
+    const byPlatformId = await conversationDb.findConversationByPlatformId(inputId);
+    if (byPlatformId) {
+      return {
+        conversation: byPlatformId,
+        platformConversationId: byPlatformId.platform_conversation_id,
+      };
+    }
+
+    const byDbId = await conversationDb.getConversationById(inputId);
+    if (byDbId) {
+      getLog().warn(
+        {
+          requestedConversationId: inputId,
+          platformConversationId: byDbId.platform_conversation_id,
+        },
+        'conversation_id_normalized_from_db_id'
+      );
+      return {
+        conversation: byDbId,
+        platformConversationId: byDbId.platform_conversation_id,
+      };
+    }
+
+    return { conversation: null, platformConversationId: inputId };
+  }
+
   /**
    * Re-enter the orchestrator after a paused approval gate is resolved, so a
    * web-dispatched workflow continues (approve) or runs its on_reject prompt
@@ -1799,21 +1829,20 @@ export function registerApiRoutes(
       return apiError(c, 400, 'Invalid workflow name');
     }
     try {
-      const { conversationId, message } = getValidatedBody(c, runWorkflowBodySchema);
+      const { conversationId: requestedConversationId, message } = getValidatedBody(
+        c,
+        runWorkflowBodySchema
+      );
+      const { conversation: conv, platformConversationId } =
+        await resolveConversationRouteTarget(requestedConversationId);
       // Persist user message and register DB ID (same as message endpoint)
-      let conv: Awaited<ReturnType<typeof conversationDb.findConversationByPlatformId>> = null;
-      try {
-        conv = await conversationDb.findConversationByPlatformId(conversationId);
-      } catch (e: unknown) {
-        getLog().error({ err: e, conversationId }, 'conversation_lookup_failed');
-      }
       if (conv) {
         try {
           await messageDb.addMessage(conv.id, 'user', message);
         } catch (e: unknown) {
           getLog().error({ err: e, conversationId: conv.id }, 'message_persistence_failed');
         }
-        webAdapter.setConversationDbId(conversationId, conv.id);
+        webAdapter.setConversationDbId(platformConversationId, conv.id);
         // Generate title for sidebar (fire-and-forget)
         if (!conv.title) {
           void generateAndSetTitle(
@@ -1827,7 +1856,7 @@ export function registerApiRoutes(
       }
 
       const fullMessage = `/workflow run ${workflowName} ${message}`;
-      const result = await dispatchToOrchestrator(conversationId, fullMessage);
+      const result = await dispatchToOrchestrator(platformConversationId, fullMessage);
       return c.json(result);
     } catch (error) {
       getLog().error({ err: error }, 'run_workflow_failed');

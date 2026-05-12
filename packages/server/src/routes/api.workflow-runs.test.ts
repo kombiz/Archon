@@ -305,6 +305,7 @@ function makeApp(): { app: OpenAPIHono; mockWebAdapter: WebAdapter } {
 describe('POST /api/workflows/:name/run', () => {
   beforeEach(() => {
     mockFindConversationByPlatformId.mockReset();
+    mockGetConversationById.mockReset();
     mockHandleMessage.mockReset();
     mockAddMessage.mockReset();
     mockGenerateAndSetTitle.mockReset();
@@ -358,6 +359,41 @@ describe('POST /api/workflows/:name/run', () => {
       expect.anything(),
       'web-test-abc',
       '/workflow run test-suite Run tests',
+      expect.objectContaining({
+        isolationHints: { workflowType: 'thread', workflowId: 'web-test-abc' },
+      })
+    );
+  });
+
+  test('normalizes internal conversation DB ids to platform conversation ids', async () => {
+    mockFindConversationByPlatformId.mockImplementationOnce(async () => null);
+    mockGetConversationById.mockImplementationOnce(async () => ({
+      id: 'internal-uuid-123',
+      platform_conversation_id: 'web-test-abc',
+      platform_type: 'web',
+    }));
+    mockAddMessage.mockImplementationOnce(async () => ({
+      id: 'msg-1',
+      conversation_id: MOCK_CONV.id,
+      role: 'user' as const,
+      content: 'Deploy',
+      metadata: '{}',
+      created_at: NOW,
+    }));
+    mockHandleMessage.mockImplementationOnce(async () => {});
+
+    const { app } = makeApp();
+    const response = await app.request('/api/workflows/deploy/run', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ conversationId: 'internal-uuid-123', message: 'Deploy' }),
+    });
+
+    expect(response.status).toBe(200);
+    expect(mockHandleMessage).toHaveBeenCalledWith(
+      expect.anything(),
+      'web-test-abc',
+      '/workflow run deploy Deploy',
       expect.objectContaining({
         isolationHints: { workflowType: 'thread', workflowId: 'web-test-abc' },
       })
