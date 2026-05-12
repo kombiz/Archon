@@ -2,8 +2,8 @@
  * Standalone repository clone/register logic.
  * Extracted from command-handler.ts for reuse by REST endpoints.
  */
-import { access, rm } from 'fs/promises';
-import { join, basename, resolve } from 'path';
+import { access, lstat, readdir, rm } from 'fs/promises';
+import { join, basename, normalize, resolve } from 'path';
 import * as codebaseDb from '../db/codebases';
 import { sanitizeError } from '../utils/credential-sanitizer';
 import { execFileAsync } from '@archon/git';
@@ -12,6 +12,7 @@ import {
   getCommandFolderSearchPaths,
   ensureProjectStructure,
   getProjectSourcePath,
+  getProjectWorktreesPath,
   createProjectSourceSymlink,
   parseOwnerRepo,
 } from '@archon/paths';
@@ -32,6 +33,49 @@ export interface RegisterResult {
   defaultCwd: string;
   commandCount: number;
   alreadyExisted: boolean;
+}
+
+async function repointManagedSourceToLocalIfSafe(
+  owner: string,
+  repo: string,
+  localPath: string
+): Promise<void> {
+  const sourcePath = getProjectSourcePath(owner, repo);
+
+  if (normalize(sourcePath) === normalize(localPath)) {
+    return;
+  }
+
+  try {
+    const sourceStats = await lstat(sourcePath);
+    if (sourceStats.isSymbolicLink()) {
+      return;
+    }
+    if (!sourceStats.isDirectory()) {
+      return;
+    }
+  } catch (error) {
+    const err = error as NodeJS.ErrnoException;
+    if (err.code === 'ENOENT') {
+      await createProjectSourceSymlink(owner, repo, localPath);
+      return;
+    }
+    throw error;
+  }
+
+  const worktreesPath = getProjectWorktreesPath(owner, repo);
+  const worktreeEntries = await readdir(worktreesPath).catch((): string[] => []);
+  if (worktreeEntries.length > 0) {
+    getLog().warn(
+      { owner, repo, sourcePath, worktreesPath, count: worktreeEntries.length },
+      'project_source_repoint_skipped_active_worktrees'
+    );
+    return;
+  }
+
+  await rm(sourcePath, { recursive: true, force: true });
+  await createProjectSourceSymlink(owner, repo, localPath);
+  getLog().info({ owner, repo, sourcePath, localPath }, 'project_source_repointed_to_local');
 }
 
 /**
@@ -288,6 +332,10 @@ export async function cloneRepository(repoUrl: string): Promise<RegisterResult> 
  * Register an existing local repository in the database (no git clone).
  */
 export async function registerRepository(localPath: string): Promise<RegisterResult> {
+  // Mounted local repos can be owned by a different host UID/GID, so trust the
+  // explicit path before running git metadata checks.
+  await execFileAsync('git', ['config', '--global', '--add', 'safe.directory', localPath]);
+
   // Validate path exists and is a git repo
   try {
     await execFileAsync('git', ['-C', localPath, 'rev-parse', '--git-dir']);
@@ -347,6 +395,7 @@ export async function registerRepository(localPath: string): Promise<RegisterRes
   const projRepo = parsed?.repo ?? repoName;
   await ensureProjectStructure(projOwner, projRepo);
   await createProjectSourceSymlink(projOwner, projRepo, localPath);
+  await repointManagedSourceToLocalIfSafe(projOwner, projRepo, localPath);
   getLog().info(
     { owner: projOwner, repo: projRepo, path: getProjectSourcePath(projOwner, projRepo) },
     'project_structure_created'

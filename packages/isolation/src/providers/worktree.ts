@@ -13,6 +13,7 @@ import {
   execFileAsync,
   findWorktreeByBranch,
   getCanonicalRepoPath,
+  getDefaultBranch,
   getWorktreeBase,
   listWorktrees,
   mkdirAsync,
@@ -706,7 +707,10 @@ export class WorktreeProvider implements IIsolationProvider {
 
     // Sync uses only the configured base branch (or auto-detects via getDefaultBranch).
     // request.fromBranch is the start-point for worktree creation, not a sync target.
-    const baseBranch = await this.syncWorkspaceBeforeCreate(repoPath, worktreeConfig?.baseBranch);
+    const { branch: baseBranch, warnings } = await this.syncWorkspaceBeforeCreate(
+      repoPath,
+      worktreeConfig?.baseBranch
+    );
 
     const override: WorktreeBaseOverride = {
       repoLocal: resolveRepoLocalOverride(worktreeConfig?.path, repoPath),
@@ -739,7 +743,6 @@ export class WorktreeProvider implements IIsolationProvider {
       worktreeConfig
     );
 
-    const warnings: string[] = [];
     if (configLoadFailed) {
       warnings.push(
         'Config file could not be loaded — copyFiles configuration was not applied. Check your .archon/config.yaml for syntax errors.'
@@ -766,27 +769,52 @@ export class WorktreeProvider implements IIsolationProvider {
    * - Configured base branch missing → config fix hint
    * - Network errors, timeouts → connectivity hint
    */
-  private async syncWorkspaceBeforeCreate(
+  private isRecoverableLocalFetchFailure(errorMessage: string): boolean {
+    return (
+      errorMessage.includes('host key verification failed') ||
+      errorMessage.includes('permission denied (publickey)') ||
+      errorMessage.includes('could not read from remote repository') ||
+      errorMessage.includes('authentication failed')
+    );
+  }
+
+  private async resolveLocalBaseBranch(
     repoPath: RepoPath,
     configuredBaseBranch?: string
   ): Promise<string> {
+    const branch = configuredBaseBranch ?? (await getDefaultBranch(repoPath));
+    try {
+      await execFileAsync('git', ['-C', repoPath, 'rev-parse', '--verify', branch], {
+        timeout: 10000,
+      });
+      return branch;
+    } catch (error) {
+      const err = error as Error;
+      throw new Error(
+        `Remote sync failed and no usable local base branch '${branch}' was found in ${repoPath}: ${err.message}`
+      );
+    }
+  }
+
+  private async syncWorkspaceBeforeCreate(
+    repoPath: RepoPath,
+    configuredBaseBranch?: string
+  ): Promise<{ branch: string; warnings: string[] }> {
+    const isManagedClone = repoPath
+      .replace(/\\/g, '/')
+      .startsWith(getArchonWorkspacesPath().replace(/\\/g, '/'));
     try {
       getLog().debug(
         { repoPath, branch: configuredBaseBranch ?? 'auto-detect' },
         'workspace_sync_starting'
       );
-      // Only hard-reset for Archon-managed clones (under ~/.archon/workspaces/).
-      // Locally-registered repos get fetch-only to avoid destroying uncommitted work.
-      const isManagedClone = repoPath
-        .replace(/\\/g, '/')
-        .startsWith(getArchonWorkspacesPath().replace(/\\/g, '/'));
       const { branch } = await syncWorkspace(
         repoPath,
         configuredBaseBranch ? toBranchName(configuredBaseBranch) : undefined,
         { resetAfterFetch: isManagedClone }
       );
       getLog().debug({ repoPath, branch }, 'workspace_synced');
-      return branch;
+      return { branch, warnings: [] };
     } catch (error) {
       const err = error as Error & { code?: string };
       const errorMessage = err.message.toLowerCase();
@@ -805,6 +833,11 @@ export class WorktreeProvider implements IIsolationProvider {
       } else if (errorMessage.includes('configured base branch')) {
         // Configured branch errors are fatal - user needs to fix their config
         throw err;
+      } else if (!isManagedClone && this.isRecoverableLocalFetchFailure(errorMessage)) {
+        const branch = await this.resolveLocalBaseBranch(repoPath, configuredBaseBranch);
+        const warning = `Remote fetch failed (${err.message}). Using local branch '${branch}' without syncing origin.`;
+        getLog().warn({ repoPath, branch, err }, 'workspace_sync_fallback_to_local_branch');
+        return { branch, warnings: [warning] };
       } else {
         // Network errors, timeouts — cannot guarantee correct start-point
         throw new Error(
@@ -1050,11 +1083,17 @@ export class WorktreeProvider implements IIsolationProvider {
     // Clean up any orphan directory before creating worktree
     await this.cleanOrphanDirectoryIfExists(worktreePath);
 
+    const isManagedClone = repoPath
+      .replace(/\\/g, '/')
+      .startsWith(getArchonWorkspacesPath().replace(/\\/g, '/'));
+
     // Determine start-point: explicit fromBranch overrides base branch
     const startPoint =
       request.workflowType === 'task' && request.fromBranch
         ? request.fromBranch
-        : `origin/${baseBranch}`;
+        : isManagedClone
+          ? `origin/${baseBranch}`
+          : baseBranch;
 
     try {
       // Try to create with new branch

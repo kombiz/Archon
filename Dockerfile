@@ -72,9 +72,25 @@ RUN apt-get update && apt-get install -y \
     gnupg \
     gosu \
     postgresql-client \
+    ripgrep \
+    erlang \
+    elixir \
     # Chromium for agent-browser E2E testing (drives browser via CDP)
     chromium \
     && rm -rf /var/lib/apt/lists/*
+
+ARG MISE_VERSION=2026.3.17
+RUN curl -fsSL "https://github.com/jdx/mise/releases/download/v${MISE_VERSION}/mise-v${MISE_VERSION}-linux-x64" \
+    -o /usr/local/bin/mise \
+    && chmod +x /usr/local/bin/mise
+
+ENV MISE_YES=1
+
+ARG UV_VERSION=0.7.3
+RUN curl -fsSL "https://github.com/astral-sh/uv/releases/download/${UV_VERSION}/uv-x86_64-unknown-linux-gnu.tar.gz" \
+    | tar -xz -C /tmp \
+    && install -m 0755 /tmp/uv-x86_64-unknown-linux-gnu/uv /usr/local/bin/uv \
+    && rm -rf /tmp/uv-x86_64-unknown-linux-gnu
 
 # Install GitHub CLI
 RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg \
@@ -84,13 +100,11 @@ RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | d
     && apt-get install -y gh \
     && rm -rf /var/lib/apt/lists/*
 
-# Install agent-browser CLI (Vercel Labs) for E2E testing workflows
-# - Uses npm (not bun) because postinstall script downloads the native Rust binary
-# - After install, symlink the Rust binary directly and purge nodejs/npm (~60MB saved)
-# - The npm entry point is a Node.js wrapper; the native binary works standalone
-# - agent-browser auto-detects Docker (via /.dockerenv) and adds --no-sandbox to Chromium
+# Install Node.js toolchain needed by downstream workflows and agent-browser.
+# Keep npm/pnpm in the image because target repos frequently validate with them.
+# agent-browser still uses npm because its postinstall downloads the native binary.
 RUN apt-get update && apt-get install -y --no-install-recommends nodejs npm \
-    && npm install -g agent-browser@0.22.1 \
+    && npm install -g agent-browser@0.22.1 pnpm@10.11.0 \
     && NATIVE_BIN=$(find /usr/local/lib/node_modules/agent-browser -name 'agent-browser-*' -type f -executable 2>/dev/null | head -1) \
     && if [ -n "$NATIVE_BIN" ]; then \
          cp "$NATIVE_BIN" /usr/local/bin/agent-browser-native \
@@ -101,8 +115,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends nodejs npm \
        fi \
     && npm cache clean --force \
     && rm -rf /usr/local/lib/node_modules/agent-browser \
-    && apt-get purge -y nodejs npm \
-    && apt-get autoremove -y \
     && rm -rf /var/lib/apt/lists/*
 
 # Point agent-browser to system Chromium (avoids ~400MB Chrome for Testing download)

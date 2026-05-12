@@ -233,7 +233,7 @@ describe('WorktreeProvider', () => {
       expect(env.workingPath).toContain('issue-42');
       expect(env.status).toBe('active');
 
-      // Verify git worktree add was called with -b flag and origin/main as start-point
+      // Local repos should branch from the local base branch tip, not origin/main.
       expect(execSpy).toHaveBeenCalledWith(
         'git',
         expect.arrayContaining([
@@ -244,7 +244,7 @@ describe('WorktreeProvider', () => {
           expect.any(String),
           '-b',
           'archon/issue-42',
-          'origin/main',
+          'main',
         ]),
         expect.any(Object)
       );
@@ -338,7 +338,7 @@ describe('WorktreeProvider', () => {
       // Verify branch was reset to start-point
       expect(execSpy).toHaveBeenCalledWith(
         'git',
-        ['-C', '/workspace/repo', 'branch', '-f', 'archon/task-test-adapters', 'origin/main'],
+        ['-C', '/workspace/repo', 'branch', '-f', 'archon/task-test-adapters', 'main'],
         expect.any(Object)
       );
 
@@ -673,7 +673,7 @@ describe('WorktreeProvider', () => {
       // Verify branch was reset to start-point before checkout
       expect(execSpy).toHaveBeenCalledWith(
         'git',
-        ['-C', '/workspace/repo', 'branch', '-f', 'archon/issue-42', 'origin/main'],
+        ['-C', '/workspace/repo', 'branch', '-f', 'archon/issue-42', 'main'],
         expect.any(Object)
       );
 
@@ -2227,7 +2227,7 @@ describe('WorktreeProvider', () => {
       expect(getDefaultBranchSpy).not.toHaveBeenCalled();
     });
 
-    test('uses resolved base branch as worktree start-point', async () => {
+    test('uses resolved local base branch as worktree start-point for local repos', async () => {
       worktreeExistsSpy.mockResolvedValue(false);
       syncWorkspaceSpy.mockResolvedValue({ branch: 'develop', synced: true });
 
@@ -2239,6 +2239,36 @@ describe('WorktreeProvider', () => {
       expect(execSpy).toHaveBeenCalledWith(
         'git',
         expect.arrayContaining([
+          'worktree',
+          'add',
+          expect.any(String),
+          '-b',
+          'archon/issue-42',
+          'develop',
+        ]),
+        expect.any(Object)
+      );
+    });
+
+    test('uses origin base branch as worktree start-point for managed clones', async () => {
+      worktreeExistsSpy.mockResolvedValue(false);
+      syncWorkspaceSpy.mockResolvedValue({ branch: 'develop', synced: true });
+
+      const configLoader: RepoConfigLoader = async () => ({ baseBranch: 'develop' });
+      provider = new WorktreeProvider(configLoader);
+
+      const request: IsolationRequest = {
+        ...baseRequest,
+        canonicalRepoPath: '/test/.archon/workspaces/owner/repo/source',
+      };
+
+      await provider.create(request);
+
+      expect(execSpy).toHaveBeenCalledWith(
+        'git',
+        expect.arrayContaining([
+          '-C',
+          '/test/.archon/workspaces/owner/repo/source',
           'worktree',
           'add',
           expect.any(String),
@@ -2346,6 +2376,53 @@ describe('WorktreeProvider', () => {
       );
     });
 
+    test('falls back to local base branch for local repos when origin fetch fails with SSH trust error', async () => {
+      worktreeExistsSpy.mockResolvedValue(false);
+      const configLoader: RepoConfigLoader = async () => ({ baseBranch: 'main' });
+      provider = new WorktreeProvider(configLoader);
+      syncWorkspaceSpy.mockRejectedValue(
+        new Error(
+          'Sync fetch from origin/main failed: Command failed: git fetch origin main\n' +
+            'Host key verification failed.\n' +
+            'fatal: Could not read from remote repository.\n'
+        )
+      );
+      execSpy.mockImplementation(async (_cmd, args) => {
+        if (args.includes('rev-parse') && args.includes('--verify') && args.includes('main')) {
+          return { stdout: 'abc123\n', stderr: '' };
+        }
+        return { stdout: '', stderr: '' };
+      });
+
+      const env = await provider.create(baseRequest);
+
+      expect(syncWorkspaceSpy).toHaveBeenCalledWith('/workspace/owner/repo', 'main', {
+        resetAfterFetch: false,
+      });
+      expect(execSpy).toHaveBeenCalledWith(
+        'git',
+        ['-C', '/workspace/owner/repo', 'rev-parse', '--verify', 'main'],
+        expect.any(Object)
+      );
+      expect(execSpy).toHaveBeenCalledWith(
+        'git',
+        expect.arrayContaining([
+          '-C',
+          '/workspace/owner/repo',
+          'worktree',
+          'add',
+          expect.any(String),
+          '-b',
+          'archon/issue-42',
+          'main',
+        ]),
+        expect.any(Object)
+      );
+      expect(env.warnings).toEqual([
+        expect.stringContaining("Using local branch 'main' without syncing origin"),
+      ]);
+    });
+
     test('throws with config error details when repo config fails to load and no fromBranch', async () => {
       const configLoader: RepoConfigLoader = async () => {
         throw new Error('Config error');
@@ -2386,6 +2463,33 @@ describe('WorktreeProvider', () => {
 
       await expect(provider.create(baseRequest)).rejects.toThrow(
         'Failed to fetch base branch from origin'
+      );
+    });
+
+    test('does not fall back to local branch for managed clones when SSH trust fails', async () => {
+      worktreeExistsSpy.mockResolvedValue(false);
+      const configLoader: RepoConfigLoader = async () => ({ baseBranch: 'main' });
+      provider = new WorktreeProvider(configLoader);
+
+      const request: IsolationRequest = {
+        ...baseRequest,
+        canonicalRepoPath: '/test/.archon/workspaces/owner/repo/source',
+      };
+      syncWorkspaceSpy.mockRejectedValue(
+        new Error(
+          'Sync fetch from origin/main failed: Command failed: git fetch origin main\n' +
+            'Host key verification failed.\n' +
+            'fatal: Could not read from remote repository.\n'
+        )
+      );
+
+      await expect(provider.create(request)).rejects.toThrow(
+        'Failed to fetch base branch from origin'
+      );
+      expect(execSpy).not.toHaveBeenCalledWith(
+        'git',
+        ['-C', '/test/.archon/workspaces/owner/repo/source', 'rev-parse', '--verify', 'main'],
+        expect.any(Object)
       );
     });
   });

@@ -5,10 +5,31 @@ set -e
 # Named volumes inherit these from the image layer on first run; bind mounts do not,
 # which causes the Claude subprocess to fail silently when spawned with a missing cwd.
 mkdir -p /.archon/workspaces /.archon/worktrees
+cd /app
 
 # Determine if we need to use gosu for privilege dropping
 if [ "$(id -u)" = "0" ]; then
-  # Running as root: fix volume permissions, then drop to appuser
+  # When a host repo root is bind-mounted, run the server as the owner of that
+  # tree so local git repos remain writable for fetch/worktree operations.
+  if [ -n "${ARCHON_HOST_REPO_ROOT:-}" ] && [ -d "${ARCHON_HOST_REPO_ROOT}" ]; then
+    HOST_REPO_UID="$(stat -c '%u' "${ARCHON_HOST_REPO_ROOT}" 2>/dev/null || true)"
+    HOST_REPO_GID="$(stat -c '%g' "${ARCHON_HOST_REPO_ROOT}" 2>/dev/null || true)"
+    if [ -n "${HOST_REPO_UID}" ] && [ -n "${HOST_REPO_GID}" ]; then
+      if ! getent group "${HOST_REPO_GID}" >/dev/null 2>&1; then
+        groupadd -g "${HOST_REPO_GID}" archonhost
+        HOST_REPO_GROUP=archonhost
+      else
+        HOST_REPO_GROUP="$(getent group "${HOST_REPO_GID}" | cut -d: -f1)"
+      fi
+      usermod -o -u "${HOST_REPO_UID}" -g "${HOST_REPO_GROUP}" appuser
+    fi
+  fi
+
+  # Keep Archon's state writable by the runtime UID/GID.
+  if ! chown -Rh appuser:appuser /app 2>/dev/null; then
+    echo "ERROR: Failed to fix ownership of /app — volume may be read-only or mounted with incompatible options" >&2
+    exit 1
+  fi
   if ! chown -Rh appuser:appuser /.archon 2>/dev/null; then
     echo "ERROR: Failed to fix ownership of /.archon — volume may be read-only or mounted with incompatible options" >&2
     exit 1
@@ -21,6 +42,11 @@ if [ "$(id -u)" = "0" ]; then
     echo "ERROR: Failed to fix ownership of /home/appuser — volume may be read-only or mounted with incompatible options" >&2
     exit 1
   fi
+
+  # Force git/npm/Bun subprocesses to keep using /home/appuser.
+  export HOME=/home/appuser
+  export USER=appuser
+  export LOGNAME=appuser
   RUNNER="gosu appuser"
 else
   # Already running as non-root (e.g., --user flag or Kubernetes)
@@ -57,7 +83,7 @@ done
 # Configure git to use GH_TOKEN for HTTPS clones via credential helper
 # Uses a helper function so the token stays in the environment, not in ~/.gitconfig
 if [ -n "$GH_TOKEN" ]; then
-  $RUNNER git config --global credential."https://github.com".helper \
+  $RUNNER git config --global --replace-all credential."https://github.com".helper \
     '!f() { echo "username=x-access-token"; echo "password=${GH_TOKEN}"; }; f'
 fi
 

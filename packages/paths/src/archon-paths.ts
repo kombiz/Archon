@@ -394,9 +394,15 @@ export function resolveProjectRootFromCwd(cwd: string): string | null {
 
 /**
  * Create the project directory structure (source/, worktrees/, artifacts/, logs/).
- * Safe to call multiple times - uses recursive mkdir.
+ * Safe to call multiple times.
+ *
+ * Create the project root first, then each child directory deterministically.
+ * This avoids occasional recursive-mkdir failures on bind-mounted Docker volumes
+ * when multiple sibling paths race to materialize the same missing parent.
  */
 export async function ensureProjectStructure(owner: string, repo: string): Promise<void> {
+  await mkdir(getProjectRoot(owner, repo), { recursive: true });
+
   const dirs = [
     getProjectSourcePath(owner, repo),
     getProjectWorktreesPath(owner, repo),
@@ -404,7 +410,9 @@ export async function ensureProjectStructure(owner: string, repo: string): Promi
     getProjectLogsPath(owner, repo),
   ];
 
-  await Promise.all(dirs.map(dir => mkdir(dir, { recursive: true })));
+  for (const dir of dirs) {
+    await mkdir(dir, { recursive: true });
+  }
 }
 
 /**

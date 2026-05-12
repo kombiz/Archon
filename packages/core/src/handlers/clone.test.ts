@@ -44,16 +44,23 @@ mock.module('../db/codebases', () => ({
 
 // ── @archon/paths mock ──────────────────────────────────────────────────────
 const mockLogger = createMockLogger();
+const mockEnsureProjectStructure = mock(() => Promise.resolve());
+const mockGetProjectSourcePath = mock(
+  (owner: string, repo: string) => `/home/test/.archon/workspaces/${owner}/${repo}/source`
+);
+const mockGetProjectWorktreesPath = mock(
+  (owner: string, repo: string) => `/home/test/.archon/workspaces/${owner}/${repo}/worktrees`
+);
+const mockCreateProjectSourceSymlink = mock(() => Promise.resolve());
 
 mock.module('@archon/paths', () => ({
   createLogger: mock(() => mockLogger),
   expandTilde: mock((p: string) => p.replace(/^~/, '/home/test')),
   getCommandFolderSearchPaths: mock(() => ['.archon/commands']),
-  ensureProjectStructure: mock(() => Promise.resolve()),
-  getProjectSourcePath: mock(
-    (owner: string, repo: string) => `/home/test/.archon/workspaces/${owner}/${repo}/source`
-  ),
-  createProjectSourceSymlink: mock(() => Promise.resolve()),
+  ensureProjectStructure: mockEnsureProjectStructure,
+  getProjectSourcePath: mockGetProjectSourcePath,
+  getProjectWorktreesPath: mockGetProjectWorktreesPath,
+  createProjectSourceSymlink: mockCreateProjectSourceSymlink,
   parseOwnerRepo: mock((name: string) => {
     const parts = name.split('/');
     return parts.length === 2 ? { owner: parts[0], repo: parts[1] } : null;
@@ -72,6 +79,8 @@ import { cloneRepository, registerRepository } from './clone';
 // ── Spies for fs/promises and @archon/git ──────────────────────────────────
 let spyFsAccess: ReturnType<typeof spyOn>;
 let spyFsRm: ReturnType<typeof spyOn>;
+let spyFsLstat: ReturnType<typeof spyOn>;
+let spyFsReaddir: ReturnType<typeof spyOn>;
 let spyExecFileAsync: ReturnType<typeof spyOn>;
 
 function setupSpies(): void {
@@ -80,6 +89,10 @@ function setupSpies(): void {
     Object.assign(new Error('ENOENT'), { code: 'ENOENT' })
   );
   spyFsRm = spyOn(fsPromises, 'rm').mockResolvedValue(undefined);
+  spyFsLstat = spyOn(fsPromises, 'lstat').mockRejectedValue(
+    Object.assign(new Error('ENOENT'), { code: 'ENOENT' })
+  );
+  spyFsReaddir = spyOn(fsPromises, 'readdir').mockResolvedValue([]);
   spyExecFileAsync = spyOn(gitUtils, 'execFileAsync').mockResolvedValue({
     stdout: '',
     stderr: '',
@@ -89,6 +102,8 @@ function setupSpies(): void {
 function restoreSpies(): void {
   spyFsAccess?.mockRestore();
   spyFsRm?.mockRestore();
+  spyFsLstat?.mockRestore();
+  spyFsReaddir?.mockRestore();
   spyExecFileAsync?.mockRestore();
 }
 
@@ -103,6 +118,10 @@ function clearMocks(): void {
   mockFindCodebaseByName.mockReset();
   mockUpdateCodebase.mockReset();
   mockFindMarkdownFilesRecursive.mockReset();
+  mockEnsureProjectStructure.mockClear();
+  mockGetProjectSourcePath.mockClear();
+  mockGetProjectWorktreesPath.mockClear();
+  mockCreateProjectSourceSymlink.mockClear();
   mockLogger.info.mockClear();
   mockLogger.debug.mockClear();
   mockLogger.warn.mockClear();
@@ -590,6 +609,73 @@ describe('registerRepository', () => {
     expect(result.name).toBe('owner/repo');
   });
 
+  test('adds safe.directory before validating a local repo', async () => {
+    spyExecFileAsync.mockImplementation((cmd: string, args: string[]) => {
+      if (args[0] === 'config') return Promise.resolve({ stdout: '', stderr: '' });
+      if (args.includes('rev-parse')) return Promise.resolve({ stdout: '.git', stderr: '' });
+      if (args.includes('get-url'))
+        return Promise.resolve({ stdout: 'https://github.com/owner/repo', stderr: '' });
+      return Promise.resolve({ stdout: '', stderr: '' });
+    });
+    mockFindCodebaseByDefaultCwd.mockResolvedValueOnce(null);
+    mockCreateCodebase.mockResolvedValueOnce(
+      makeCodebase({ name: 'owner/repo', default_cwd: '/home/user/myrepo' }) as ReturnType<
+        typeof makeCodebase
+      >
+    );
+
+    await registerRepository('/home/user/myrepo');
+
+    const configCallIndex = spyExecFileAsync.mock.calls.findIndex(
+      ([cmd, args]) =>
+        cmd === 'git' &&
+        args[0] === 'config' &&
+        args[1] === '--global' &&
+        args[2] === '--add' &&
+        args[3] === 'safe.directory' &&
+        args[4] === '/home/user/myrepo'
+    );
+    const revParseCallIndex = spyExecFileAsync.mock.calls.findIndex(
+      ([cmd, args]) => cmd === 'git' && args.includes('rev-parse')
+    );
+
+    expect(configCallIndex).toBeGreaterThanOrEqual(0);
+    expect(revParseCallIndex).toBeGreaterThan(configCallIndex);
+  });
+
+  test('repoints a managed source directory to the local repo when no worktrees exist', async () => {
+    spyExecFileAsync.mockImplementation((cmd: string, args: string[]) => {
+      if (args[0] === 'config') return Promise.resolve({ stdout: '', stderr: '' });
+      if (args.includes('rev-parse')) return Promise.resolve({ stdout: '.git', stderr: '' });
+      if (args.includes('get-url'))
+        return Promise.resolve({ stdout: 'https://github.com/owner/repo', stderr: '' });
+      return Promise.resolve({ stdout: '', stderr: '' });
+    });
+    spyFsLstat.mockResolvedValue({
+      isSymbolicLink: () => false,
+      isDirectory: () => true,
+    } as Awaited<ReturnType<typeof fsPromises.lstat>>);
+    spyFsReaddir.mockResolvedValueOnce([]);
+    mockFindCodebaseByDefaultCwd.mockResolvedValueOnce(null);
+    mockCreateCodebase.mockResolvedValueOnce(
+      makeCodebase({ name: 'owner/repo', default_cwd: '/home/user/myrepo' }) as ReturnType<
+        typeof makeCodebase
+      >
+    );
+
+    await registerRepository('/home/user/myrepo');
+
+    expect(spyFsRm).toHaveBeenCalledWith('/home/test/.archon/workspaces/owner/repo/source', {
+      recursive: true,
+      force: true,
+    });
+    expect(mockCreateProjectSourceSymlink).toHaveBeenCalledWith(
+      'owner',
+      'repo',
+      '/home/user/myrepo'
+    );
+  });
+
   test('returns existing record immediately when path already registered', async () => {
     spyExecFileAsync.mockResolvedValue({ stdout: '.git', stderr: '' });
     const existingCodebase = makeCodebase({
@@ -608,7 +694,11 @@ describe('registerRepository', () => {
 
   // ── Validation ─────────────────────────────────────────────────────────
   test('throws when path is not a git repository', async () => {
-    spyExecFileAsync.mockRejectedValueOnce(new Error('not a git repository'));
+    spyExecFileAsync.mockImplementation((cmd: string, args: string[]) => {
+      if (args[0] === 'config') return Promise.resolve({ stdout: '', stderr: '' });
+      if (args.includes('rev-parse')) return Promise.reject(new Error('not a git repository'));
+      return Promise.resolve({ stdout: '', stderr: '' });
+    });
 
     await expect(registerRepository('/home/user/not-a-repo')).rejects.toThrow(
       'Path is not a git repository'
