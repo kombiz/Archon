@@ -1071,7 +1071,11 @@ describe('CodexProvider', () => {
     });
 
     test('throws actionable model-access message for unavailable configured model', async () => {
-      mockRunStreamed.mockRejectedValue(new Error('403 Forbidden: model not available'));
+      mockRunStreamed.mockRejectedValue(
+        new Error(
+          "400 invalid_request_error: The 'gpt-5.3-codex' model is not supported when using Codex with a ChatGPT account."
+        )
+      );
 
       const consumeGenerator = async () => {
         for await (const _ of client.sendQuery('test', '/workspace', undefined, {
@@ -1082,12 +1086,56 @@ describe('CodexProvider', () => {
       };
 
       await expect(consumeGenerator()).rejects.toThrow(
-        'Model "gpt-5.3-codex" is not available for your account'
+        'Model "gpt-5.3-codex" is not available for the current Codex login'
       );
-      await expect(consumeGenerator()).rejects.toThrow('model: gpt-5.2-codex');
+      await expect(consumeGenerator()).rejects.toThrow(
+        'remove the explicit `model:` setting from your Archon config/workflow'
+      );
     });
 
-    test('uses generic dashboard guidance when fallback mapping is unknown', async () => {
+    test('falls back to default model when an explicit model is unsupported for the current login', async () => {
+      let callCount = 0;
+      mockRunStreamed.mockImplementation(() => {
+        callCount++;
+        if (callCount === 1) {
+          return Promise.reject(
+            new Error(
+              "400 invalid_request_error: The 'gpt-5.3-codex' model is not supported when using Codex with a ChatGPT account."
+            )
+          );
+        }
+        return Promise.resolve({
+          events: (async function* () {
+            yield {
+              type: 'item.completed',
+              item: { type: 'agent_message', text: 'Recovered with default model' },
+            };
+            yield { type: 'turn.completed', usage: defaultUsage };
+          })(),
+        });
+      });
+
+      const chunks = [];
+      for await (const chunk of client.sendQuery('test', '/workspace', undefined, {
+        model: 'gpt-5.3-codex',
+      })) {
+        chunks.push(chunk);
+      }
+
+      expect(callCount).toBe(2);
+      expect(chunks).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            type: 'system',
+            content: expect.stringContaining('Retrying with the Codex default model'),
+          }),
+          { type: 'assistant', content: 'Recovered with default model' },
+          { type: 'result', sessionId: 'new-thread-id', tokens: { input: 10, output: 5 } },
+        ])
+      );
+    });
+
+    test('uses generic guidance when fallback mapping is unknown', async () => {
       mockRunStreamed.mockRejectedValue(new Error('model not available'));
 
       const consumeGenerator = async () => {
@@ -1099,10 +1147,10 @@ describe('CodexProvider', () => {
       };
 
       await expect(consumeGenerator()).rejects.toThrow(
-        'Model "o5-pro" is not available for your account'
+        'Model "o5-pro" is not available for the current Codex login'
       );
       await expect(consumeGenerator()).rejects.toThrow(
-        'update your model in ~/.archon/config.yaml'
+        'switch this stack to a Codex/API auth context'
       );
     });
 

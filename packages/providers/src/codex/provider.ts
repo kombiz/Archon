@@ -63,16 +63,18 @@ async function getCodex(configCodexBinaryPath?: string): Promise<Codex> {
 function buildThreadOptions(
   cwd: string,
   model?: string,
-  assistantConfig?: Record<string, unknown>
+  assistantConfig?: Record<string, unknown>,
+  options?: { ignoreConfiguredModel?: boolean }
 ): ThreadOptions {
   const config = parseCodexConfig(assistantConfig ?? {});
+  const resolvedModel = options?.ignoreConfiguredModel ? model : (model ?? config.model);
   return {
     workingDirectory: cwd,
     skipGitRepoCheck: true,
     sandboxMode: 'danger-full-access',
     networkAccessEnabled: true,
     approvalPolicy: 'never',
-    model: model ?? config.model,
+    model: resolvedModel,
     modelReasoningEffort: config.modelReasoningEffort,
     webSearchMode: config.webSearchMode,
     additionalDirectories: config.additionalDirectories,
@@ -87,32 +89,27 @@ function buildCodexEnv(requestEnv: Record<string, string>): Record<string, strin
   return { ...baseEnv, ...requestEnv };
 }
 
-const CODEX_MODEL_FALLBACKS: Record<string, string> = {
-  'gpt-5.3-codex': 'gpt-5.2-codex',
-};
-
 function isModelAccessError(errorMessage: string): boolean {
   const m = errorMessage.toLowerCase();
   const hasModel = m.includes('model');
   const hasAvailabilitySignal =
-    m.includes('not available') || m.includes('not found') || m.includes('access denied');
+    m.includes('not available') ||
+    m.includes('not found') ||
+    m.includes('access denied') ||
+    m.includes('not supported');
   return hasModel && hasAvailabilitySignal;
 }
 
 function buildModelAccessMessage(model?: string): string {
   const normalizedModel = model?.trim();
   const selectedModel = normalizedModel || 'the configured model';
-  const suggested = normalizedModel ? CODEX_MODEL_FALLBACKS[normalizedModel] : undefined;
-
-  const fixLine = suggested
-    ? `To fix: update your model in ~/.archon/config.yaml:\n  assistants:\n    codex:\n      model: ${suggested}`
-    : 'To fix: update your model in ~/.archon/config.yaml to one your account can access.';
-
-  const workflowLine = suggested
-    ? `Or set it per-workflow with \`model: ${suggested}\` in workflow YAML.`
-    : 'Or set it per-workflow with a valid `model:` in workflow YAML.';
-
-  return `❌ Model "${selectedModel}" is not available for your account.\n\n${fixLine}\n\n${workflowLine}`;
+  return (
+    `❌ Model "${selectedModel}" is not available for the current Codex login.\n\n` +
+    'If this Archon stack is using a ChatGPT Codex login, remove the explicit `model:` setting ' +
+    'from your Archon config/workflow so Codex can choose a supported default.\n\n' +
+    'If you need a specific Codex/API-only model id, switch this stack to a ' +
+    'Codex/API auth context that has access to that model.'
+  );
 }
 
 const MAX_SUBPROCESS_RETRIES = 3;
@@ -548,7 +545,9 @@ export class CodexProvider implements IAgentProvider {
 
     // 1. Initialize SDK and build thread options
     const codex = await this.createCodexClient(codexConfig.codexBinaryPath, requestOptions?.env);
-    const threadOptions = buildThreadOptions(cwd, requestOptions?.model, assistantConfig);
+    let threadOptions = buildThreadOptions(cwd, requestOptions?.model, assistantConfig);
+    let attemptedModelFallback = false;
+    const explicitModel = threadOptions.model;
 
     if (requestOptions?.abortSignal?.aborted) {
       throw new Error('Query aborted');
@@ -635,9 +634,23 @@ export class CodexProvider implements IAgentProvider {
           throw new Error('Query aborted');
         }
 
+        if (!attemptedModelFallback && explicitModel && isModelAccessError(err.message)) {
+          attemptedModelFallback = true;
+          threadOptions = buildThreadOptions(cwd, undefined, assistantConfig, {
+            ignoreConfiguredModel: true,
+          });
+          yield {
+            type: 'system',
+            content:
+              `⚠️ Codex model "${explicitModel}" is not available for this login. ` +
+              'Retrying with the Codex default model for the current account.',
+          };
+          continue;
+        }
+
         const { enrichedError, errorClass, shouldRetry } = classifyAndEnrichCodexError(
           err,
-          requestOptions?.model
+          explicitModel
         );
 
         getLog().error(
