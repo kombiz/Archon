@@ -78,6 +78,7 @@ nodes:
       ```
     output_format:
       type: object
+      additionalProperties: false
       properties:
         input_type:
           type: string
