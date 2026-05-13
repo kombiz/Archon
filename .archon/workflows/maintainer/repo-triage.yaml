@@ -19,57 +19,7 @@ nodes:
   # Issue triage — runs concurrently with pr-link (no depends_on between them).
   # ---------------------------------------------------------------------------
   - id: triage-issues
-    model: sonnet
-    allowed_tools: [Bash, Read, Write, Task]
-    agents:
-      brief-gen:
-        description: >-
-          Reads a single GitHub issue and returns a concise JSON brief,
-          plus a template-adherence check if the caller provided template
-          context. Used for duplicate detection + template-fill reporting.
-        model: haiku
-        tools: [Bash, Read]
-        prompt: |
-          You are a concise GitHub issue summariser. The caller's prompt
-          will include an issue number AND (optionally) the issue
-          templates from `.github/ISSUE_TEMPLATE/`.
-
-          Fetch the issue:
-            gh issue view <N> --json number,title,body,labels,author
-
-          Return ONLY a single JSON object — no fences, no prose:
-
-          {
-            "number": <N>,
-            "summary": "2-3 sentence neutral summary",
-            "primarySymptom": "one short sentence — the core symptom or ask",
-            "area": "best-guess tag, e.g. backend, frontend, docs, core, isolation, cli, workflows, providers",
-            "templateAdherence": {
-              "templateType": "bug_report | feature_request | other | none",
-              "sectionsFilled": ["<section headers where the reporter wrote non-trivial content>"],
-              "sectionsMissing": ["<template section headers clearly left empty or untouched>"],
-              "quality": "good | partial | empty | no-template-context"
-            }
-          }
-
-          Template-adherence rules:
-          - If the caller did NOT include templates → `quality: "no-template-context"`, skip sections.
-          - `quality: "good"` = most template sections have real content.
-          - `quality: "partial"` = headers present but several sections look blank/placeholder.
-          - `quality: "empty"` = body has nothing matching the template shape.
-          - A section counts as MISSING when its body is empty, whitespace-only,
-            or contains only HTML-comment placeholders like `<!-- ... -->`.
-            Such sections must go in `sectionsMissing`, NOT `sectionsFilled`.
-
-          Be terse. If the issue body is empty, set area='unknown' and
-          quality='empty'.
-
-          ERROR HANDLING — if the `gh issue view` call fails (auth,
-          rate limit, network, or non-zero exit), do NOT emit JSON.
-          Instead print exactly one line on stdout:
-              ERROR: <one-line reason>
-          The orchestrator detects the `ERROR:` prefix and handles it
-          (logs, counts, may abort). Never emit partial/fabricated JSON.
+    model: gpt-5.4
     prompt: |
       You are the issue-triage orchestrator for the repository in the
       current working directory.
@@ -86,17 +36,13 @@ nodes:
           full body you would have posted.
         - Do NOT run `gh issue (comment|close|edit)`. Do NOT use the Write
           tool on `.archon/state/*.json`.
-        - When delegating via Task to triage-agent/brief-gen, PREPEND this
-          exact sentence to every Task prompt:
-              "DRY_RUN=1 is active. Do NOT apply labels or mutate the
-               issue in any way. Instead print `[DRY] would ...` lines
-               describing what you would have done."
+        - When you describe skipped mutations, include the exact issue number and the labels or comment body you would have applied.
         - End with the standard summary table, but prefix the title
           `## (DRY RUN) Issue triage — <now>`.
 
       Your job on every (non-dry) run:
-        1. Apply labels to any unlabeled open issues (delegate to triage-agent)
-        2. Generate or refresh briefs for new/changed open issues (delegate to brief-gen)
+        1. Apply labels to any unlabeled open issues directly and conservatively
+        2. Generate or refresh briefs for new/changed open issues directly in this run
         3. Detect potential duplicates across all briefs
         4. Comment on suspected duplicates with a "reply in 3 days or auto-close" note
         5. Auto-close stale warnings from prior runs whose authors never replied
@@ -167,54 +113,25 @@ nodes:
         - Compute sha. If no entry in `state.briefs[N]` OR stored sha differs
           → needs BRIEF. Otherwise reuse the cached brief.
 
-      ## 4. LABEL PASS — parallel fan-out to triage-agent
+      ## 4. LABEL PASS — direct classification and labeling
 
-      PREFLIGHT: verify the on-disk sub-agent definition exists before
-      attempting any Task call:
+      For each issue needing labels:
+        - Fetch it with `gh issue view <N> --json number,title,body,labels`.
+        - Classify conservatively into the repository's existing type / effort / priority / area labels.
+        - Respect existing labels and only add clearly-supported missing categories.
+        - If classification is ambiguous, skip labeling that issue and mention it in the summary.
+        - If DRY_RUN=1, print `[DRY] would label issue #<N> with: ...` instead of mutating.
+        - Otherwise apply labels with `gh issue edit <N> --add-label ...`.
 
-          test -f .claude/agents/triage-agent.md
+      Labeling is helpful but not worth false positives. Skip uncertain cases.
 
-      If missing, SKIP the whole label pass (do not attempt Task calls
-      that would fail obscurely at runtime). Log:
-          "[triage-issues] label pass skipped: .claude/agents/triage-agent.md
-           missing — install the skill-adjacent agent file to enable labeling."
-      Continue to the brief pass — labeling is a nice-to-have, not a blocker.
-
-      Spawn the existing on-disk `triage-agent` sub-agent in PARALLEL (a
-      single assistant turn with multiple Task tool calls — this matters
-      for speed). Per-task prompt:
-
-          "Triage open issue #<N> in this repository. Fetch it via
-           `gh issue view`, classify by type/effort/priority/area, and
-           apply the missing label categories via `gh issue edit`.
-           Respect existing labels."
-
-      Wait for all label tasks to settle before moving on.
-
-      ## 5. BRIEF PASS — parallel fan-out to brief-gen
-      For every issue that needs a brief, spawn the inline `brief-gen`
-      sub-agent in PARALLEL (single turn, multiple Task calls).
-
-      Per-task prompt template:
-          "Brief issue #<N>.
-
-           <if issue-templates.md has content, inline it here with a header>
-           ISSUE TEMPLATES (for templateAdherence check):
-           <file contents>"
-
-      If `$ARTIFACTS_DIR/issue-templates.md` is empty, omit the template
-      block — brief-gen will return `quality: "no-template-context"`.
-
-      Parse each response as JSON. On parse failure OR when the response
-      starts with `ERROR:` (sub-agent signalling a gh/auth/rate-limit
-      problem — see brief-gen prompt):
-        - Log the failed issue number and the first 200 chars of the
-          raw response.
-        - Track in a `failedBriefs` array for the summary (`failed=N`
-          with the list of numbers).
-        - Do NOT merge into state (keep the previous cached brief).
-      Merge successful results into `state.briefs[N]` with a freshly
-      computed sha and `briefedAt = now-iso`. Preserve `templateAdherence`.
+      ## 5. BRIEF PASS — direct briefing
+      For every issue that needs a brief:
+        - Fetch it with `gh issue view <N> --json number,title,body,labels,author,updatedAt`.
+        - Produce one brief object with: `number`, `summary`, `primarySymptom`, `area`, and `templateAdherence`.
+        - If `$ARTIFACTS_DIR/issue-templates.md` is empty, set `templateAdherence.quality = "no-template-context"`.
+        - If the gh call fails, log `ERROR:` with the issue number, add it to `failedBriefs`, and keep any prior cached brief.
+        - Merge successful briefs into `state.briefs[N]` with a fresh sha and `briefedAt = now-iso`.
 
       If `failedBriefs.length > 0` AND the failures look systemic
       (≥50% of briefs this run failed), ABORT before the cluster pass
@@ -303,14 +220,12 @@ nodes:
 
       - NEVER close an issue that is not tracked in `pendingDedupComments`
         with `postedAt` ≥ 3 days ago AND no reply after that timestamp.
-      - NEVER label issues yourself — always delegate to `triage-agent`.
+      - Apply labels yourself only when the category is clear from the issue text and existing label taxonomy.
       - If `gh` returns an auth error or rate limit, stop the run cleanly
         and report in the summary. Do NOT partially mutate state.
       - State writes are ATOMIC per run — only write the final merged
         state once at step 9. If a pass fails midway, the previous state
         remains.
-      - Parallel Task fan-out is strict: ONE assistant turn with MANY
-        Task tool calls, not sequential Task calls.
 
   # ---------------------------------------------------------------------------
   # Closed-dedup check — follow-up to triage-issues. Checks whether any
@@ -321,45 +236,7 @@ nodes:
   # ---------------------------------------------------------------------------
   - id: closed-dedup-check
     depends_on: [triage-issues]
-    model: sonnet
-    allowed_tools: [Bash, Read, Write, Task]
-    agents:
-      closed-brief-gen:
-        description: >-
-          Reads a single recently-CLOSED GitHub issue and returns a JSON
-          brief including close reason and any closing PR reference.
-        model: haiku
-        tools: [Bash, Read]
-        prompt: |
-          You are a concise summariser for CLOSED GitHub issues. You will
-          be given an issue number in the caller's prompt.
-
-          Fetch the issue with:
-            gh issue view <N> --json number,title,body,stateReason,closedAt,comments,labels
-
-          Also check the closing comment thread for any `#<pr>` reference
-          that looks like it closed the issue (keywords: closed by, fixed by,
-          resolved by, Closes, Fixes, Resolves).
-
-          Return ONLY a single JSON object on stdout — no fences, no prose:
-
-          {
-            "number": <N>,
-            "summary": "2-3 sentence summary of what the issue was",
-            "primarySymptom": "one short sentence — the core symptom",
-            "area": "single best-guess area tag (same vocabulary as open briefs)",
-            "closedAt": "<ISO timestamp>",
-            "stateReason": "completed | not_planned | duplicate | null (normalize gh CLI's UPPERCASE output to lowercase)",
-            "resolvedByPr": "<PR number if identifiable from closing thread, else null>"
-          }
-
-          Be terse. If `stateReason` (normalized to lowercase) is
-          `not_planned` or `duplicate`, that matters for the match
-          verdict downstream — include it honestly.
-
-          ERROR HANDLING — if `gh issue view` fails, print exactly:
-              ERROR: <one-line reason>
-          on a single stdout line. Do NOT emit partial/fabricated JSON.
+    model: gpt-5.4
     prompt: |
       You check whether any currently OPEN issue duplicates a recently
       CLOSED one. A reporter may have filed a bug that was fixed months
@@ -372,15 +249,13 @@ nodes:
 
       If SKIP_CLOSED_DEDUP=1 — print
           "Skipping closed-dedup-check per SKIP_CLOSED_DEDUP=1"
-      and exit immediately. No gh calls, no state read, no Task fan-out.
+      and exit immediately. No gh calls and no state read.
 
       If DRY_RUN=1 — READ-ONLY:
         - Do read-only work (gh list/view, state reads, clustering).
         - For every mutation (comment, close, state write), print `[DRY] would ...`.
         - Do NOT run gh issue comment/close.
         - Do NOT use Write on `.archon/state/*.json`.
-        - When spawning closed-brief-gen via Task, prepend to its prompt:
-              "DRY_RUN=1 is active. Run only read-only gh commands."
         - End with a summary prefixed `## (DRY RUN) Closed-dedup check — <now>`.
 
       # Context artifact from triage-issues
@@ -461,16 +336,12 @@ nodes:
         - If `state.closedBriefs[N]` exists AND sha matches → reuse.
         - Else → needs BRIEF.
 
-      ## 4. BRIEF PASS — parallel Task fan-out to closed-brief-gen
-      Spawn `closed-brief-gen` in PARALLEL (single assistant turn, multiple
-      Task calls) for every closed issue needing a brief. Per-task prompt:
-
-          "Brief closed issue #<N>."
-
-      Parse each JSON response. On parse failure OR `ERROR:` sentinel:
-      log the issue number + first 200 chars, track in `failedClosedBriefs`,
-      skip. Merge successes into `state.closedBriefs`. Abort the cluster
-      pass if ≥50% failed (same rule as triage-issues).
+      ## 4. BRIEF PASS — direct briefing
+      For every closed issue needing a brief:
+        - Fetch it with `gh issue view <N> --json number,title,body,stateReason,closedAt,comments,labels`.
+        - Build a compact brief with `summary`, `primarySymptom`, `area`, `closedAt`, `stateReason`, and `resolvedByPr`.
+        - On gh failure, log `ERROR:` with the issue number, add it to `failedClosedBriefs`, and skip it.
+        - Merge successful briefs into `state.closedBriefs`. Abort the cluster pass if ≥50% failed.
 
       ## 5. CROSS-CLUSTER PASS — match open vs closed
       For each OPEN issue brief (from triage-state.json):
@@ -556,7 +427,7 @@ nodes:
         erodes trust. When in doubt, skip.
       - If `gh` errors (auth, rate limit), abort cleanly and summarise.
       - State writes are ATOMIC — one Write at step 8.
-      - Parallel Task fan-out required for step 4 only. Step 6 is sequential
+      - Step 4 is read-heavy; keep the work systematic. Step 6 is sequential
         to capture comment IDs reliably.
 
   # ---------------------------------------------------------------------------
@@ -567,49 +438,7 @@ nodes:
   # other top-level nodes.
   # ---------------------------------------------------------------------------
   - id: closed-pr-dedup-check
-    model: sonnet
-    allowed_tools: [Bash, Read, Write, Task]
-    agents:
-      pr-brief-gen:
-        description: >-
-          Reads a single PR (open OR closed) and returns a compact JSON
-          brief suitable for cross-comparison.
-        model: haiku
-        tools: [Bash, Read]
-        prompt: |
-          You summarise a single GitHub PR. You will be given a PR number
-          and a `state` hint (open/closed) in the caller's prompt.
-
-          Fetch:
-            gh pr view <N> --json number,title,body,state,headRefName,changedFiles,additions,deletions,mergedAt,closedAt,stateReason
-            gh pr diff <N> --color=never | head -c 30000
-
-          Return ONLY a single JSON object — no fences, no prose:
-
-          {
-            "number": <N>,
-            "state": "open" | "closed" | "merged",
-            "stateReason": "<closed reason if applicable, else null>",
-            "title": "<title>",
-            "summary": "2-3 sentence neutral summary of what the PR changes",
-            "intent": "one-sentence core goal (bug fix X, add feature Y, refactor Z)",
-            "scope": "affected-area tag (backend/frontend/docs/core/providers/etc)",
-            "filesChanged": <count>,
-            "mergedAt": "<iso or null>",
-            "closedAt": "<iso or null>"
-          }
-
-          Be terse. Don't quote commit messages verbatim unless they are
-          the only information available.
-
-          If the diff was truncated (you hit the 30,000-char limit when
-          reading `gh pr diff`), set `diffTruncated: true` on the brief
-          output so the orchestrator knows to be more conservative about
-          `fully-addresses` claims.
-
-          ERROR HANDLING — if `gh pr view` or `gh pr diff` fails, print:
-              ERROR: <one-line reason>
-          on a single stdout line. Do NOT emit partial/fabricated JSON.
+    model: gpt-5.4
     prompt: |
       You find OPEN PRs that duplicate or supersede a recently-CLOSED PR.
       A contributor may have missed that a similar change was already
@@ -628,8 +457,6 @@ nodes:
         - All read-only gh calls OK.
         - Do NOT run `gh pr comment`. Do NOT use Write on state files.
         - Print `[DRY] would ...` for every mutation.
-        - When spawning pr-brief-gen via Task, prepend:
-              "DRY_RUN=1 is active. Run only read-only gh commands."
         - End with a summary prefixed `## (DRY RUN) Closed-PR dedup — <now>`.
 
       # State file
@@ -686,18 +513,12 @@ nodes:
           and the sha matches → reuse the cached brief.
         - Else → needs BRIEF.
 
-      ## 4. BRIEF PASS — parallel Task fan-out to pr-brief-gen
-      Spawn `pr-brief-gen` in PARALLEL for every PR needing a brief
-      (open AND closed, all in a single assistant turn if possible — the
-      sub-agent handles both via the `state` hint).
-
-      Per-task prompt template:
-          "Brief PR #<N> — state=<open|closed>."
-
-      Parse each JSON response. On parse failure OR `ERROR:` sentinel:
-      log the PR number + first 200 chars, track in `failedBriefs`, skip.
-      Merge successes into the appropriate `{open,closed}Briefs` bucket.
-      Abort the cluster pass if ≥50% failed.
+      ## 4. BRIEF PASS — direct briefing
+      For every open or closed PR needing a brief:
+        - Fetch it with `gh pr view <N> --json ...` and `gh pr diff <N> --color=never | head -c 30000`.
+        - Build a compact brief with state, intent, scope, diff summary, and `diffTruncated` when needed.
+        - On gh failure, log `ERROR:` with the PR number, add it to `failedBriefs`, and skip it.
+        - Merge successful briefs into the appropriate `{open,closed}Briefs` bucket. Abort the cluster pass if ≥50% failed.
 
       ## 5. CROSS-CLUSTER PASS — match open vs closed
       For each OPEN PR brief:
@@ -770,7 +591,7 @@ nodes:
       - Idempotent comments — always check existing PR comments before
         posting to avoid noise.
       - State writes are ATOMIC — one Write at step 7.
-      - Parallel Task fan-out for step 4 only. Step 6 sequential.
+      - Step 4 is read-heavy; step 6 stays sequential for reliable comment capture.
       - Strict matching — false positives on PR dedup are a maintainer
         trust hit. When ambiguous, skip.
 
@@ -778,77 +599,7 @@ nodes:
   # PR ↔ issue linker — runs concurrently with triage-issues.
   # ---------------------------------------------------------------------------
   - id: link-prs
-    model: sonnet
-    allowed_tools: [Bash, Read, Write, Task]
-    agents:
-      pr-issue-matcher:
-        description: >-
-          Given one PR (title + body + diff) and a compact list of open
-          issues, returns related-issue matches AND a template-adherence
-          check if the caller provided the PR template. Conservative —
-          prefers "related" over "fully-addresses" when in doubt.
-        model: haiku
-        tools: [Bash, Read]
-        prompt: |
-          You match a single GitHub PR to the open issues it touches AND
-          score its adherence to the repository's PR template (if the
-          caller provided one).
-
-          Inputs in the caller's prompt:
-            - PR number
-            - Compact issue list (one per line: `#<N> <title> — <body excerpt>`)
-            - Optional PR_TEMPLATE section
-
-          Your work:
-            1. Fetch the PR:
-                 gh pr view <N> --json number,title,body,files,headRefName
-            2. Fetch a compact diff:
-                 gh pr diff <N> --color=never | head -c 60000
-            3. For each open issue, decide:
-               - `fully-addresses`: PR's scope CLEARLY covers EVERY symptom
-                 in the issue. Err strictly toward "related" if unsure.
-               - `related`: touches same area / partial fix.
-               - `unrelated`: omit.
-            4. Score template adherence against the PR_TEMPLATE (if present):
-               - Enumerate the `(required)` sections and other section
-                 headers from the template.
-               - Mark each section as filled (non-trivial reporter content)
-                 or missing (empty / placeholder / HTML-comment-only).
-
-          Return ONLY a single JSON object — no fences, no prose:
-
-          {
-            "prNumber": <N>,
-            "candidates": [
-              {
-                "issue": <issueNumber>,
-                "relation": "fully-addresses" | "related",
-                "evidence": "one-sentence justification citing files/symptoms"
-              }
-            ],
-            "templateAdherence": {
-              "sectionsFilled": ["<section titles with real content>"],
-              "sectionsMissing": ["<empty / placeholder section titles>"],
-              "requiredMissing": ["<subset of sectionsMissing that are marked (required)>"],
-              "quality": "good | partial | empty | no-template-context"
-            }
-          }
-
-          `quality` scale:
-          - "good" = required sections all filled AND most non-required too
-          - "partial" = some required sections empty but not all
-          - "empty" = essentially no template content beyond headers
-          - "no-template-context" = caller didn't include PR_TEMPLATE
-
-          No matches: candidates=[]. Always return templateAdherence
-          (may be no-template-context).
-
-          Default bias: when the PR description doesn't explicitly claim
-          to close the issue, mark it `related`, never `fully-addresses`.
-
-          ERROR HANDLING — if `gh pr view` or `gh pr diff` fails, print:
-              ERROR: <one-line reason>
-          on a single stdout line. Do NOT emit partial/fabricated JSON.
+    model: gpt-5.4
     prompt: |
       You are the PR-to-issue linker for the repository in the current
       working directory.
@@ -872,16 +623,12 @@ nodes:
           body you would have posted on which target.
         - Do NOT run `gh issue comment` or `gh pr comment`. Do NOT use
           the Write tool on `.archon/state/*.json`.
-        - When delegating via Task to pr-issue-matcher, PREPEND this exact
-          sentence to every Task prompt:
-              "DRY_RUN=1 is active. Run only read-only gh commands."
-          (pr-issue-matcher is already read-only, so this is belt-and-braces.)
         - End with the standard summary table, but prefix the title
           `## (DRY RUN) PR-issue linker — <now>`.
 
       Your job on every (non-dry, non-skipped) run:
         1. For every open PR not yet fully processed, identify related
-           open issues via the pr-issue-matcher sub-agent.
+           open issues directly in this run.
         2. Add a `Closes #X` SUGGESTION comment on the PR only when the
            matcher says the PR fully addresses the issue AND you — the
            orchestrator — agree after re-reading the issue + PR diff.
@@ -960,27 +707,16 @@ nodes:
         - If `state.linkedPrs[N]` exists AND its sha matches → SKIP.
         - Else → needs MATCHING.
 
-      ## 4. MATCH PASS — parallel Task fan-out to pr-issue-matcher
-      Spawn `pr-issue-matcher` in PARALLEL for every PR needing matching
-      (single turn, multiple Task calls).
-
-      Per-task prompt template:
-          "Match PR #<N> against the open issues below.
-           <issues list — one per line: `#<num> <title> — <first 120 chars of body>`>
-
-           <if pr-template.md is non-empty, append:>
-           PR_TEMPLATE (for templateAdherence scoring):
-           <file contents>"
-
-      Keep the issue list compact. Parse each response as JSON. On parse
-      failure OR `ERROR:` sentinel: log the PR number + first 200 chars,
-      track in `failedMatches`, skip that PR. Preserve the full
-      `templateAdherence` object in `state.linkedPrs[<pr>]` for the
-      digest downstream. Abort the downstream passes if ≥50% of PRs
-      failed matching (same half-failure rule as the briefing passes).
+      ## 4. MATCH PASS — direct matching
+      For every PR needing matching:
+        - Fetch the PR with `gh pr view <N> --json number,title,body,files,headRefName`.
+        - Fetch a compact diff with `gh pr diff <N> --color=never | head -c 60000`.
+        - Compare that PR against the compact open-issue list and build `candidates` plus `templateAdherence`.
+        - Keep the issue list compact, preserve the full `templateAdherence` object in `state.linkedPrs[<pr>]`, and treat gh failures as `failedMatches`.
+        - Abort downstream passes if ≥50% of PRs fail matching.
 
       ## 5. VERIFY PASS — confirm any "fully-addresses"
-      Haiku is optimistic; Sonnet (you) owns the final judgment. For each
+      Initial matching can be optimistic; you own the final judgment. For each
       candidate tagged `fully-addresses`:
         - Read issue body fully: `gh issue view <issue> --json body,title,labels`
         - Read PR body + diff:   `gh pr view <pr> --json body,title`
@@ -1141,8 +877,7 @@ nodes:
         evidence is overwhelming.
       - If `gh` errors out (auth, rate limit), abort cleanly and summarise.
       - State writes are ATOMIC per run — a single Write at step 7.
-      - Parallel Task fan-out is required for the match pass only. Act
-        pass is sequential for idempotent comment-ID capture.
+      - Keep the match pass systematic. The act pass is sequential for idempotent comment-ID capture.
       - Template nudge comments happen AT MOST ONCE per PR (tracked via
         `templateNudgedAt`). Never re-nudge — contributors will ignore us.
 
@@ -1153,8 +888,7 @@ nodes:
   # nudge each item once per quiet period.
   # ---------------------------------------------------------------------------
   - id: stale-nudge
-    model: sonnet
-    allowed_tools: [Bash, Read, Write]
+    model: gpt-5.4
     prompt: |
       You post gentle reminders on GitHub issues and PRs that have gone
       quiet. No auto-close. No Task fan-out needed — this is direct work.
@@ -1291,8 +1025,7 @@ nodes:
       - closed-dedup-check
       - closed-pr-dedup-check
       - stale-nudge
-    model: sonnet
-    allowed_tools: [Bash, Read, Write]
+    model: gpt-5.4
     prompt: |
       You synthesise the outputs of all prior nodes in this run into one
       maintainer-facing digest.
