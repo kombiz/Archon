@@ -11,7 +11,7 @@ concurrency:
 jobs:
   # ─── Tier 1: Deterministic (no API keys needed) ────────────────────────
   e2e-deterministic:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, onlyarag-archon-x64]
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
@@ -32,7 +32,7 @@ jobs:
 
   # ─── Tier 2a: Claude provider ──────────────────────────────────────────
   e2e-claude:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, onlyarag-archon-x64]
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
@@ -62,7 +62,7 @@ jobs:
 
   # ─── Tier 2b: Codex provider ───────────────────────────────────────────
   e2e-codex:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, onlyarag-archon-x64]
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
@@ -91,7 +91,7 @@ jobs:
 
   # ─── Tier 3: Mixed providers ───────────────────────────────────────────
   e2e-mixed:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, onlyarag-archon-x64]
     timeout-minutes: 5
     needs: [e2e-claude, e2e-codex]
     steps:

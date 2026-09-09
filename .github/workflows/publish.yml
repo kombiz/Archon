@@ -14,7 +14,7 @@ env:
 
 jobs:
   docker:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, onlyarag-archon-x64]
     permissions:
       contents: read
       packages: write

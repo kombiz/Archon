@@ -36,7 +36,7 @@ jobs:
             target: bun-darwin-arm64
             binary: archon-darwin-arm64
 
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ matrix.os == 'ubuntu-latest' && fromJSON('["self-hosted","onlyarag-archon-x64"]') || matrix.os }}
     steps:
       - uses: actions/checkout@v4
 
@@ -216,7 +216,7 @@ jobs:
 
   release:
     needs: build
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, onlyarag-archon-x64]
     permissions:
       contents: write
     steps:
@@ -331,7 +331,7 @@ jobs:
 
   update-homebrew:
     needs: release
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, onlyarag-archon-x64]
     permissions:
       contents: write
     steps:

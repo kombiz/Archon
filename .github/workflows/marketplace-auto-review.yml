@@ -9,7 +9,7 @@ on:
 jobs:
   auto-review:
     name: Run marketplace auto-review
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, onlyarag-archon-x64]
     permissions:
       contents: write
       pull-requests: write
