@@ -172,4 +172,18 @@ describe('marketplace GitHub REST adapter', () => {
     ).text();
     expect(workflow).toContain("| awk 'NR <= 3000'");
   });
+
+  test('fails closed when migrated API commands fail', async () => {
+    const workflow = await Bun.file(
+      new URL(
+        '../.archon/workflows/maintainer/marketplace-pr-review-and-merge.yaml',
+        import.meta.url
+      )
+    ).text();
+    for (const nodeId of ['fetch-pr-metadata', 'verify-scope', 'act']) {
+      const start = workflow.indexOf(`  - id: ${nodeId}\n`);
+      const end = workflow.indexOf('\n  - id:', start + 1);
+      expect(workflow.slice(start, end)).toContain('set -euo pipefail');
+    }
+  });
 });

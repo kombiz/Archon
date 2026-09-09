@@ -24,6 +24,7 @@ nodes:
 
   - id: fetch-pr-metadata
     bash: |
+      set -euo pipefail
       PR_NUM=$(echo "$ARGUMENTS" | tr -d "'\"\`\n " | grep -oE '[0-9]+' | head -1)
       if [ -z "$PR_NUM" ]; then
         echo "ERROR: Could not extract PR number from arguments: $ARGUMENTS" >&2
@@ -43,6 +44,7 @@ nodes:
 
   - id: verify-scope
     bash: |
+      set -euo pipefail
       PR_NUM=$(cat "$ARTIFACTS_DIR/.pr-number")
 
       # Get list of changed files (already in pr-meta.json)
@@ -277,6 +279,7 @@ nodes:
 
   - id: act
     bash: |
+      set -euo pipefail
       PR_NUM=$(cat "$ARTIFACTS_DIR/.pr-number")
       DECISION=$(jq -r '.decision' "$ARTIFACTS_DIR/decision.json")
       REASON=$(jq -r '.reason' "$ARTIFACTS_DIR/decision.json")
