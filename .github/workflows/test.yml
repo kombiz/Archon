@@ -65,9 +65,11 @@ jobs:
 
       - name: Smoke test — container starts and serves /api/health
         run: |
-          docker run -d --name archon-smoke -e PORT=3000 -e CLAUDE_USE_GLOBAL_AUTH=true -p 3000:3000 archon-ci:test
+          docker run -d --name archon-smoke -e PORT=3000 -e CLAUDE_USE_GLOBAL_AUTH=true -p 127.0.0.1::3000 archon-ci:test
+          smoke_port="$(docker port archon-smoke 3000/tcp)"
+          smoke_port="${smoke_port##*:}"
           sleep 5
-          curl --fail --retry 10 --retry-delay 3 --retry-all-errors http://localhost:3000/api/health
+          curl --fail --retry 10 --retry-delay 3 --retry-all-errors "http://127.0.0.1:${smoke_port}/api/health"
 
       - name: Dump container logs on failure
         if: failure()
