@@ -9,7 +9,7 @@ on:
 jobs:
   auto-review:
     name: Run marketplace auto-review
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, onlyarag-archon-x64]
     permissions:
       contents: write
       pull-requests: write
@@ -47,7 +47,7 @@ jobs:
 
       - name: Run marketplace auto-review workflow
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: |
           bun run cli workflow run marketplace-pr-review-and-merge --no-worktree \

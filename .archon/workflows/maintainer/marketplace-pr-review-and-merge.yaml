@@ -24,6 +24,7 @@ nodes:
 
   - id: fetch-pr-metadata
     bash: |
+      set -euo pipefail
       PR_NUM=$(echo "$ARGUMENTS" | tr -d "'\"\`\n " | grep -oE '[0-9]+' | head -1)
       if [ -z "$PR_NUM" ]; then
         echo "ERROR: Could not extract PR number from arguments: $ARGUMENTS" >&2
@@ -31,10 +32,8 @@ nodes:
       fi
       echo "$PR_NUM" > "$ARTIFACTS_DIR/.pr-number"
 
-      # Fetch full PR metadata as JSON
-      gh pr view "$PR_NUM" \
-        --json number,title,body,author,state,isDraft,additions,deletions,changedFiles,files,baseRefName,headRefName \
-        > "$ARTIFACTS_DIR/pr-meta.json"
+      # Fetch full PR metadata as JSON, including every changed-file page.
+      bun run scripts/marketplace-github.ts metadata "$PR_NUM" > "$ARTIFACTS_DIR/pr-meta.json"
 
       cat "$ARTIFACTS_DIR/pr-meta.json"
     timeout: 30000
@@ -45,6 +44,7 @@ nodes:
 
   - id: verify-scope
     bash: |
+      set -euo pipefail
       PR_NUM=$(cat "$ARTIFACTS_DIR/.pr-number")
 
       # Get list of changed files (already in pr-meta.json)
@@ -60,7 +60,8 @@ nodes:
       fi
 
       # Fetch diff (capped at 3000 lines)
-      gh pr diff "$PR_NUM" | head -3000 > "$ARTIFACTS_DIR/pr-diff.txt"
+      bun run scripts/marketplace-github.ts diff "$PR_NUM" \
+        | awk 'NR <= 3000' > "$ARTIFACTS_DIR/pr-diff.txt"
 
       echo "SCOPE_OK" > "$ARTIFACTS_DIR/.scope-result"
       echo '{"scope_ok": true, "extra_files": []}'
@@ -278,45 +279,35 @@ nodes:
 
   - id: act
     bash: |
+      set -euo pipefail
       PR_NUM=$(cat "$ARTIFACTS_DIR/.pr-number")
-      DECISION=$(cat "$ARTIFACTS_DIR/decision.json" | jq -r '.decision')
-      REASON=$(cat "$ARTIFACTS_DIR/decision.json" | jq -r '.reason')
-      SLUG=$(cat "$ARTIFACTS_DIR/decision.json" | jq -r '.slug // empty')
+      DECISION=$(jq -r '.decision' "$ARTIFACTS_DIR/decision.json")
+      REASON=$(jq -r '.reason' "$ARTIFACTS_DIR/decision.json")
+      SLUG=$(jq -r '.slug // empty' "$ARTIFACTS_DIR/decision.json")
+      REVIEW_BODY="$ARTIFACTS_DIR/review-body.md"
 
       case "$DECISION" in
         auto_merge)
           echo "Decision: AUTO_MERGE — approving and merging PR #$PR_NUM"
-          gh pr review "$PR_NUM" --approve --body "**Marketplace Auto-Review: Approved & Merging**
-
-      $REASON
-
-      *Reviewed and auto-merged by Archon marketplace-pr-review-and-merge workflow.*"
-          gh pr merge "$PR_NUM" --squash --delete-branch --subject "feat(marketplace): add ${SLUG:-marketplace-entry}"
+          printf '**Marketplace Auto-Review: Approved & Merging**\n\n%s\n\n*Reviewed and auto-merged by Archon marketplace-pr-review-and-merge workflow.*\n' "$REASON" > "$REVIEW_BODY"
+          bun run scripts/marketplace-github.ts review "$PR_NUM" APPROVE "$REVIEW_BODY"
+          bun run scripts/marketplace-github.ts merge "$PR_NUM" "feat(marketplace): add ${SLUG:-marketplace-entry}"
           ;;
         auto_approve)
           echo "Decision: AUTO_APPROVE — approving PR #$PR_NUM (manual merge required)"
-          gh pr review "$PR_NUM" --approve --body "**Marketplace Auto-Review: Approved**
-
-      $REASON
-
-      *Reviewed by Archon marketplace-pr-review-and-merge workflow. A maintainer will merge.*"
+          printf '**Marketplace Auto-Review: Approved**\n\n%s\n\n*Reviewed by Archon marketplace-pr-review-and-merge workflow. A maintainer will merge.*\n' "$REASON" > "$REVIEW_BODY"
+          bun run scripts/marketplace-github.ts review "$PR_NUM" APPROVE "$REVIEW_BODY"
           ;;
         request_changes)
           echo "Decision: REQUEST_CHANGES — requesting changes on PR #$PR_NUM"
-          gh pr review "$PR_NUM" --request-changes --body "**Marketplace Auto-Review: Changes Requested**
-
-      $REASON
-
-      *Reviewed by Archon marketplace-pr-review-and-merge workflow.*"
+          printf '**Marketplace Auto-Review: Changes Requested**\n\n%s\n\n*Reviewed by Archon marketplace-pr-review-and-merge workflow.*\n' "$REASON" > "$REVIEW_BODY"
+          bun run scripts/marketplace-github.ts review "$PR_NUM" REQUEST_CHANGES "$REVIEW_BODY"
           ;;
         reject)
           echo "Decision: REJECT — closing PR #$PR_NUM as out of scope or unsafe"
-          gh pr review "$PR_NUM" --request-changes --body "**Marketplace Auto-Review: Rejected**
-
-      $REASON
-
-      *Reviewed by Archon marketplace-pr-review-and-merge workflow.*"
-          gh pr close "$PR_NUM" --comment "Closing this PR per the automated review above." 2>/dev/null || true
+          printf '**Marketplace Auto-Review: Rejected**\n\n%s\n\n*Reviewed by Archon marketplace-pr-review-and-merge workflow.*\n' "$REASON" > "$REVIEW_BODY"
+          bun run scripts/marketplace-github.ts review "$PR_NUM" REQUEST_CHANGES "$REVIEW_BODY"
+          bun run scripts/marketplace-github.ts close "$PR_NUM" "Closing this PR per the automated review above." || true
           ;;
         *)
           echo "ERROR: Unexpected decision value: $DECISION" >&2
