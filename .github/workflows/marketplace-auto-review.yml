@@ -47,7 +47,7 @@ jobs:
 
       - name: Run marketplace auto-review workflow
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: |
           bun run cli workflow run marketplace-pr-review-and-merge --no-worktree \
