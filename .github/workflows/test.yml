@@ -15,7 +15,7 @@ jobs:
     strategy:
       matrix:
         os: [ubuntu-latest, windows-latest]
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ matrix.os == 'ubuntu-latest' && fromJSON(github.event_name == 'pull_request' && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository && '["ubuntu-latest"]' || '["self-hosted","onlyarag-archon-x64"]') || matrix.os }}
     steps:
       - uses: actions/checkout@v4
 
@@ -43,7 +43,7 @@ jobs:
         run: bun run test
 
   docker-build:
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository && '["ubuntu-latest"]' || '["self-hosted","onlyarag-archon-x64"]') }}
     permissions:
       contents: read
       actions: write
@@ -65,9 +65,11 @@ jobs:
 
       - name: Smoke test — container starts and serves /api/health
         run: |
-          docker run -d --name archon-smoke -e PORT=3000 -e CLAUDE_USE_GLOBAL_AUTH=true -p 3000:3000 archon-ci:test
+          docker run -d --name archon-smoke -e PORT=3000 -e CLAUDE_USE_GLOBAL_AUTH=true -p 127.0.0.1::3000 archon-ci:test
+          smoke_port="$(docker port archon-smoke 3000/tcp)"
+          smoke_port="${smoke_port##*:}"
           sleep 5
-          curl --fail --retry 10 --retry-delay 3 --retry-all-errors http://localhost:3000/api/health
+          curl --fail --retry 10 --retry-delay 3 --retry-all-errors "http://127.0.0.1:${smoke_port}/api/health"
 
       - name: Dump container logs on failure
         if: failure()
