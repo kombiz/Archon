@@ -15,7 +15,7 @@ jobs:
     strategy:
       matrix:
         os: [ubuntu-latest, windows-latest]
-    runs-on: ${{ matrix.os == 'ubuntu-latest' && fromJSON(github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository && '["ubuntu-latest"]' || '["self-hosted","onlyarag-archon-x64"]') || matrix.os }}
+    runs-on: ${{ matrix.os == 'ubuntu-latest' && fromJSON(github.event_name == 'pull_request' && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository && '["ubuntu-latest"]' || '["self-hosted","onlyarag-archon-x64"]') || matrix.os }}
     steps:
       - uses: actions/checkout@v4
 
@@ -43,7 +43,7 @@ jobs:
         run: bun run test
 
   docker-build:
-    runs-on: ${{ fromJSON(github.event.pull_request.head.repo.full_name != github.repository && '["ubuntu-latest"]' || '["self-hosted","onlyarag-archon-x64"]') }}
+    runs-on: ${{ fromJSON(github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository && '["ubuntu-latest"]' || '["self-hosted","onlyarag-archon-x64"]') }}
     permissions:
       contents: read
       actions: write
